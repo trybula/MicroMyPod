@@ -3,38 +3,39 @@
   1) when folder on sd card contains any mp3 files, the value of ".000isplayable" is added to the set of dirs
   2) if MENUITEM's action is equal to void DONOTSELECT(void *) function, then it cant be selected
 */
+
+
 #include <Arduino.h>
 
 #include <U8g2lib.h>//display
 #include <Wire.h>//i2c
 #include <SPI.h>
+#include "SdFat.h"
 
 //#include <CtrlEnc.h>//rotary encoder
 #include <CtrlBtn.h>//easier buttons
 
-#include <string>
+//#include <string>
 #include <set>
 #include <vector>
 
 #include "AudioTools.h"
 #include "AudioTools/Disk/AudioSourceIdxSDFAT.h"
+#include "AudioTools/Disk/AudioSourceURL.h"
 #include "AudioTools/AudioCodecs/CodecMP3Helix.h"//mp3 decoder
 
 #include <WiFi.h>
 #include <CSV_Parser.h>
 #include <non_arduino_adaptations.h>
 
+#define IS_RP_PICO_2W
 #include "structs.h"//structs and classes
 #include "display_functions.h" //display
 #include "config.h" //configuration
 #include "menu_handling.h" //menu handling (duh)
 
-#include "driver/rtc_io.h"//deep sleep
 
-#include <BLEDevice.h>//bt
-#include <BLEUtils.h>
-#include <BLEScan.h>
-#include <BLEAdvertisedDevice.h>
+
 
 
 
@@ -54,22 +55,26 @@ void long_click(){
   is_long_clicked = true;
 }
 
-void print_wakeup_reason() {
-  esp_sleep_wakeup_cause_t wakeup_reason;
+#ifdef IS_ESP_32
+  void print_wakeup_reason() {
+    esp_sleep_wakeup_cause_t wakeup_reason;
 
-  wakeup_reason = esp_sleep_get_wakeup_cause();
+    wakeup_reason = esp_sleep_get_wakeup_cause();
 
-  switch (wakeup_reason) {
-    case ESP_SLEEP_WAKEUP_EXT0:     Serial.println("Wakeup caused by external signal using RTC_IO"); break;
-    case ESP_SLEEP_WAKEUP_EXT1:     Serial.println("Wakeup caused by external signal using RTC_CNTL"); break;
-    case ESP_SLEEP_WAKEUP_TIMER:    Serial.println("Wakeup caused by timer"); break;
-    case ESP_SLEEP_WAKEUP_TOUCHPAD: Serial.println("Wakeup caused by touchpad"); break;
-    case ESP_SLEEP_WAKEUP_ULP:      Serial.println("Wakeup caused by ULP program"); break;
-    default:                        Serial.printf("Wakeup was not caused by deep sleep: %d\n", wakeup_reason); break;
+    switch (wakeup_reason) {
+      case ESP_SLEEP_WAKEUP_EXT0:     Serial.println("Wakeup caused by external signal using RTC_IO"); break;
+      case ESP_SLEEP_WAKEUP_EXT1:     Serial.println("Wakeup caused by external signal using RTC_CNTL"); break;
+      case ESP_SLEEP_WAKEUP_TIMER:    Serial.println("Wakeup caused by timer"); break;
+      case ESP_SLEEP_WAKEUP_TOUCHPAD: Serial.println("Wakeup caused by touchpad"); break;
+      case ESP_SLEEP_WAKEUP_ULP:      Serial.println("Wakeup caused by ULP program"); break;
+      default:                        Serial.printf("Wakeup was not caused by deep sleep: %d\n", wakeup_reason); break;
+    }
   }
-}
+#else
+  void print_wakeup_reason() {}
+#endif
 
-//deep sleep implementation
+//deep sleep implementation (currently only for esp 32)
 void power_off(){
   static const unsigned char image_device_sleep_mode_black_bits[] = {0x20,0x00,0x38,0x70,0x1c,0x40,0x1e,0x20,0x8e,0x77,0x0f,0x02,0x0f,0x01,0x8f,0x07,0x1f,0x00,0x1f,0x60,0x7e,0x38,0xfe,0x3f,0xfc,0x1f,0xf8,0x0f,0xe0,0x03,0x00,0x00};
   u8g2.clearBuffer();
@@ -81,20 +86,27 @@ void power_off(){
   u8g2.sendBuffer();
 
   WiFi.mode(WIFI_OFF);
-  btStop();
-  esp_bt_controller_disable();
+
+  #ifdef IS_ESP_32
+    btStop();
+    esp_bt_controller_disable();
+    esp_sleep_enable_ext0_wakeup(WAKEUP_GPIO, 0);  //1 = High, 0 = Low
+    rtc_gpio_pulldown_dis(WAKEUP_GPIO);
+    rtc_gpio_pullup_en(WAKEUP_GPIO);
+  #endif
 
   digitalWrite(POWER_PIN, LOW);
   
   delay(100);
 
-  esp_sleep_enable_ext0_wakeup(WAKEUP_GPIO, 0);  //1 = High, 0 = Low
-  rtc_gpio_pulldown_dis(WAKEUP_GPIO);
-  rtc_gpio_pullup_en(WAKEUP_GPIO);
+
+  
 
   //Go to sleep now
   Serial.println("Going to sleep now");
-  esp_deep_sleep_start();
+  #ifdef IS_ESP_32
+    esp_deep_sleep_start();
+  #endif
   delay(100);
   Serial.println("This will never be printed");
 }
@@ -196,6 +208,7 @@ void continue_update_dirs_and_enter(void* dir){
 
 //it's used to iterate throught the directories on the sd card
 void update_dirs_and_enter(void *){
+  DirSelect.parentMenu = &Mp3Menu;
   Mp3MenuItems[1].title = "Selected folder:";
   auto Dirs = ListSubDirs((Mp3MenuItems[2].title).c_str());
   //Serial.println(Dirs.size());
@@ -220,10 +233,10 @@ void update_dirs_and_enter(void *){
       if(i_dir[0]!='.'){
         String NewPath = Mp3MenuItems[2].title+i_dir+"/";
         DirSelectItems.push_back(
-          {
+          MENUITEM{
             NewPath,
             &continue_update_dirs_and_enter, 
-            new String(NewPath),
+            &NewPath,
             NULL,
             NULL,
             {0,0}
@@ -283,20 +296,15 @@ void printMetaData(MetaDataType type, const char* str, int len){
 }
 
 //returns how much of File32 was red (in percents)
-String get_percent(String type){
-  if(type == "sd-mp3"){
-    if(player.getStream() != nullptr){
-      File32* file = (File32*)player.getStream();
-      uint percent = file->curPosition()*100 / file->fileSize();
-      return String(percent)+"%";
-    }
-    else {
-      return "wait";
-    }
+String get_percent(){
+  if(player.getStream() != nullptr){
+    File32* file = (File32*)player.getStream();
+    uint percent = file->curPosition()*100 / file->fileSize();
+    return String(percent)+"%";
   }
-
-  return "err t";
-
+  else {
+    return "wait";
+  }
 }
 
 void player_next(){
@@ -331,8 +339,6 @@ void decrease_vol(){
 }
 
 void sd_player(void*){//ealier play_from_sd
-  String type = *((String*) to_type);
-
   do{
     button.process();
     delay(50);
@@ -458,7 +464,7 @@ void sd_player(void*){//ealier play_from_sd
       u8g2.drawStr(98, 58, num.c_str());
 
       // Listened percent
-      u8g2.drawStr(10, 58, get_percent(type).c_str());
+      u8g2.drawStr(10, 58, get_percent().c_str());
 
       u8g2.sendBuffer();
     }
@@ -482,86 +488,167 @@ void sd_player(void*){//ealier play_from_sd
 
 
 //-----------SD END-------------------
+
+
+
 //------------NETWORK-----------------
 
+
+
 //a simple function to check wheather a wifi is open or has password
-bool is_pass(uint8_t enc) {
-  if (enc == WIFI_AUTH_OPEN) {
-    return false;
-  }
-  return true;
-}
+#ifdef IS_ESP_32
+  bool is_pass(uint8_t enc) {
+    if (enc == WIFI_AUTH_OPEN) {
 
-std::vector<WIFI_INFO> GetWiFi(){
-  SdFat32 sd;
-  File32 file;
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
-  delay(100);
-
-  std::vector<WIFI_INFO>V;
-
-  if (sd.begin(SD_CS_PIN, SPI_SPEED)) {
-    Serial.println("Card successfully initialized.");
-    if(!file.open(WIFI_PASS_FILE, O_READ)){
-      Serial.println("Error opening file");
+      return false;
     }
-    else{ //reading sd
-      String to_parse = file.readString();
-      file.close();
-      CSV_Parser cp(to_parse.c_str(),/*format*/ "ss", /*has_header*/ true, /*delimiter*/ WIFI_PASS_FILE_DELIMITER);
-      char ** SSIDS = (char**)cp["SSID"];
-      char ** PASS = (char**)cp["PASS"];
-      int ile = cp.getRowsCount();
-      Serial.printf("found %i Wifi credincials\n",ile);
-      if(ile>0){ //scanning wifi
-        auto cnt = WiFi.scanNetworks();
-        if (!cnt) {
-          Serial.printf("No networks found\n");
-        } else {
-          Serial.printf("Found %d networks\n\n", cnt);
-          //Serial.printf("%s\t%s\t%s\n", "SSID", "IS_PASS", "SIG_STRENGTH");
+    return true;
+  }
+  std::vector<WIFI_INFO> GetWiFi(){
+    SdFat32 sd;
+    File32 file;
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    delay(100);
 
-          for (int i = 0; i < cnt; i++) { //iterates through the wifi's available
-            if(!is_pass(WiFi.encryptionType(i))){
-              WIFI_INFO tmp;
-              tmp.SSID = String(WiFi.SSID(i).c_str());
-              tmp.PASS = "";
-              tmp.is_pass = false;
-              tmp.strength = WiFi.RSSI(i);
-              V.push_back(tmp);
-              continue;
-            }
-            for(int k=0;k<ile;k++){ //searches for match in saved wifi names
-              //Serial.printf("->%s-%s<-\n",WiFi.SSID(i),SSIDS[k]);
-              if(String(WiFi.SSID(i).c_str()).equals(String(SSIDS[k]))){
+    std::vector<WIFI_INFO>V;
+
+    if (sd.begin(SD_CS_PIN, SPI_SPEED)) {
+      Serial.println("Card successfully initialized.");
+      if(!file.open(WIFI_PASS_FILE, O_READ)){
+        Serial.println("Error opening file");
+      }
+      else{ //reading sd
+        String to_parse = file.readString();
+        file.close();
+        CSV_Parser cp(to_parse.c_str(),/*format*/ "ss", /*has_header*/ true, /*delimiter*/ WIFI_PASS_FILE_DELIMITER);
+        char ** SSIDS = (char**)cp["SSID"];
+        char ** PASS = (char**)cp["PASS"];
+        int ile = cp.getRowsCount();
+        Serial.printf("found %i Wifi credincials\n",ile);
+        if(ile>0){ //scanning wifi
+          auto cnt = WiFi.scanNetworks();
+          if (!cnt) {
+            Serial.printf("No networks found\n");
+          } else {
+            Serial.printf("Found %d networks\n\n", cnt);
+            //Serial.printf("%s\t%s\t%s\n", "SSID", "IS_PASS", "SIG_STRENGTH");
+
+            for (int i = 0; i < cnt; i++) { //iterates through the wifi's available
+              if(!is_pass(WiFi.encryptionType(i))){
                 WIFI_INFO tmp;
-                tmp.SSID = String(SSIDS[k]);
-                tmp.PASS = String(PASS[k]);
-                tmp.is_pass = true;
+                tmp.SSID = String(WiFi.SSID(i).c_str());
+                tmp.PASS = "";
+                tmp.is_pass = false;
                 tmp.strength = WiFi.RSSI(i);
                 V.push_back(tmp);
+                continue;
               }
-            //Serial.printf("%s\t%i\t%i\n", WiFi.SSID(i), is_pass(WiFi.encryptionType(i)), (WiFi.RSSI(i)));
+              for(int k=0;k<ile;k++){ //searches for match in saved wifi names
+                //Serial.printf("->%s-%s<-\n",WiFi.SSID(i),SSIDS[k]);
+                if(String(WiFi.SSID(i).c_str()).equals(String(SSIDS[k]))){
+                  WIFI_INFO tmp;
+                  tmp.SSID = String(SSIDS[k]);
+                  tmp.PASS = String(PASS[k]);
+                  tmp.is_pass = true;
+                  tmp.strength = WiFi.RSSI(i);
+                  V.push_back(tmp);
+                }
+              //Serial.printf("%s\t%i\t%i\n", WiFi.SSID(i), is_pass(WiFi.encryptionType(i)), (WiFi.RSSI(i)));
+              }
             }
           }
+          WiFi.scanDelete(); //remove scan data from memory (we have it already in struct)
         }
-        WiFi.scanDelete(); //remove scan data from memory (we have it already in struct)
       }
+      //sd.end();
     }
-    sd.end();
+    else{
+      Serial.println("Card NOT initialized.");
+    }
+    return V;
   }
-  else{
-    Serial.println("Card NOT initialized.");
+#elif defined(IS_RP_PICO_2W)
+  bool is_pass(uint8_t enc) {
+    if (enc == ENC_TYPE_NONE) {
+
+      return false;
+    }
+    return true;
   }
-  return V;
-}
+  std::vector<WIFI_INFO> GetWiFi(){
+    SdFat32 sd;
+    File32 file;
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    delay(100);
+
+    std::vector<WIFI_INFO>V;
+
+    if (sd.begin(SD_CS_PIN, SPI_SPEED)) {
+      Serial.println("Card successfully initialized.");
+      if(!file.open(WIFI_PASS_FILE, O_READ)){
+        Serial.println("Error opening file");
+      }
+      else{ //reading sd
+        String to_parse = file.readString();
+        file.close();
+        CSV_Parser cp(to_parse.c_str(),/*format*/ "ss", /*has_header*/ true, /*delimiter*/ WIFI_PASS_FILE_DELIMITER);
+        char ** SSIDS = (char**)cp["SSID"];
+        char ** PASS = (char**)cp["PASS"];
+        int ile = cp.getRowsCount();
+        Serial.printf("found %i Wifi credincials\n",ile);
+        if(ile>0){ //scanning wifi
+          auto cnt = WiFi.scanNetworks();
+          if (!cnt) {
+            Serial.printf("No networks found\n");
+          } else {
+            Serial.printf("Found %d networks\n\n", cnt);
+            //Serial.printf("%s\t%s\t%s\n", "SSID", "IS_PASS", "SIG_STRENGTH");
+
+            for (int i = 0; i < cnt; i++) { //iterates through the wifi's available
+              if(!is_pass(WiFi.encryptionType(i))){
+                WIFI_INFO tmp;
+                tmp.SSID = String(WiFi.SSID(i));
+                tmp.PASS = "";
+                tmp.is_pass = false;
+                tmp.strength = WiFi.RSSI(i);
+                V.push_back(tmp);
+                continue;
+              }
+              for(int k=0;k<ile;k++){ //searches for match in saved wifi names
+                //Serial.printf("->%s-%s<-\n",WiFi.SSID(i),SSIDS[k]);
+                if(String(WiFi.SSID(i)).equals(String(SSIDS[k]))){
+                  WIFI_INFO tmp;
+                  tmp.SSID = String(SSIDS[k]);
+                  tmp.PASS = String(PASS[k]);
+                  tmp.is_pass = true;
+                  tmp.strength = WiFi.RSSI(i);
+                  V.push_back(tmp);
+                }
+              //Serial.printf("%s\t%i\t%i\n", WiFi.SSID(i), is_pass(WiFi.encryptionType(i)), (WiFi.RSSI(i)));
+              }
+            }
+          }
+          WiFi.scanDelete(); //remove scan data from memory (we have it already in struct)
+        }
+      }
+      //sd.end();
+    }
+    else{
+      Serial.println("Card NOT initialized.");
+    }
+    return V;
+  }
+#endif
+
 
 void connect_to_wifi(void* pass){
+  ConfigMenuItems[0].title = "Select WiFI";
   WiFi.mode(WIFI_STA);
   String * password = (String*) pass;
   String ssid = (*current_menu->items)[element_index].title;
-  Serial.printf("SSID:%s/tPASS:%s",ssid.c_str(),(*password).c_str());
+  Serial.printf("SSID:%s/tPASS:%s\n",ssid.c_str(),(*password).c_str());
   if((*password) != ""){
     Serial.println("Connecting with pass");
     WiFi.begin(ssid.c_str(),(*password).c_str());
@@ -577,9 +664,10 @@ void connect_to_wifi(void* pass){
 
   while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < timeout) {
       Serial.print(".");
-      delay(250);
+      delay(100);
   }
 
+  Serial.println(WiFi.status());
   if (WiFi.status() == WL_CONNECTED) {
     static const unsigned char image_wifi_full_bits[] = {0x80,0x0f,0x00,0xe0,0x3f,0x00,0x78,0xf0,0x00,0x9c,0xcf,0x01,0xee,0xbf,0x03,0xf7,0x78,0x07,0x3a,0xe7,0x02,0xdc,0xdf,0x01,0xe8,0xb8,0x00,0x70,0x77,0x00,0xa0,0x2f,0x00,0xc0,0x1d,0x00,0x80,0x0a,0x00,0x00,0x07,0x00,0x00,0x02,0x00,0x00,0x00,0x00};
     u8g2.clearBuffer();
@@ -591,6 +679,7 @@ void connect_to_wifi(void* pass){
     u8g2.drawStr(37, 24, "CONNECTED");
 
     u8g2.sendBuffer();
+    ConfigMenuItems[0].title = "Change WiFI";
   } 
   else {
     static const unsigned char image_wifi_not_connected_bits[] = {0x84,0x0f,0x00,0x68,0x30,0x00,0x10,0xc0,0x00,0xa4,0x0f,0x01,0x42,0x30,0x02,0x91,0x40,0x04,0x08,0x85,0x00,0xc4,0x1a,0x01,0x20,0x24,0x00,0x10,0x4a,0x00,0x80,0x15,0x00,0x40,0x20,0x00,0x00,0x42,0x00,0x00,0x85,0x00,0x00,0x02,0x01,0x00,0x00,0x00};
@@ -621,12 +710,14 @@ void turn_off_wifi(void*){
   u8g2.sendBuffer();
 
   WiFi.disconnect();
+  ConfigMenuItems[0].title = "Turn On WiFI";
   WiFi.mode(WIFI_OFF);
   delay(2000);
 
   enter_parent(nullptr);
 }
 
+//updates available and connectable networks and enteres to selection screen
 void list_networks_and_enter(void *){
   thinking_rn();
   auto credincials = GetWiFi();
@@ -672,6 +763,159 @@ void list_networks_and_enter(void *){
 }
 //------------NETWORK_END-----------------
 
+void test_stations_list(void *){
+  if(WiFi.status()!=WL_CONNECTED){
+    Serial.println("you must connect to wifi");
+  }
+
+
+  SdFat32 sd;
+  File32 file;
+  if (sd.begin(SD_CS_PIN, SPI_SPEED)) {
+    Serial.println("Card successfully initialized.");
+    if(!file.open(RADIO_FILE, O_READ)){
+      Serial.println("Error opening file");
+    }
+    else{ //reading sd
+      String to_parse = file.readString();
+      file.close();
+      CSV_Parser cp(to_parse.c_str(),/*format*/ "ss", /*has_header*/ true, /*delimiter*/ RADIO_FILE_DELIMITER);
+      char ** Names = (char**)cp["NAME"];
+      char ** Urls = (char**)cp["URL"];
+      int ile = cp.getRowsCount();
+      printf("Znaleziono %i stacji\n",ile);
+      for(int i=0;i<ile;i++){
+        printf("Nazwa: %s\tUrl: %s\n",Names[i],Urls[i]);
+      }
+    }
+  }
+}
+
+//parses available radio stations and enters the selection screen
+void update_radios_and_enter(void *){
+  DirSelect.parentMenu = &RadioMenu;
+  RadioMenuItems[1].title = "Selected station:";
+  SdFat32 sd;
+  File32 file;
+  if (sd.begin(SD_CS_PIN, SPI_SPEED)) {
+    Serial.println("Card successfully initialized.");
+    if(!file.open(RADIO_FILE, O_READ)){
+      Serial.println("Error opening file");
+    }
+    else{ //reading sd
+      String to_parse = file.readString();
+      file.close();
+      CSV_Parser cp(to_parse.c_str(),/*format*/ "ss", /*has_header*/ true, /*delimiter*/ RADIO_FILE_DELIMITER);
+      char ** Names = (char**)cp["NAME"];
+      char ** Urls = (char**)cp["URL"];
+      int ile = cp.getRowsCount();
+      printf("Znaleziono %i stacji\n",ile);
+      if(ile>0){
+        Radio_stations.clear();
+      
+        for(int i=0;i<ile;i++){
+          printf("Nazwa: %s\tUrl: %s\n",Names[i],Urls[i]);
+          Radio_stations[Names[i]]=Urls[i];
+          //Radio_stations.push_back({String(Names[i]),String(Urls[i])});
+        }
+        DirSelectItems.clear();
+
+        DirSelectItems.push_back(//remain in this folder
+          {
+            "Cancel",
+            &pick_a_string,
+            &RadioMenuItems[2].title,
+            NULL,
+            NULL,
+            {0,0}
+          }
+        );
+        for(int i=0;i<ile;i++){
+          DirSelectItems.push_back(//remain in this folder
+            {
+              String(Names[i]),
+              &pick_a_string,
+              &RadioMenuItems[2].title,
+              NULL,
+              NULL,
+              {0,0}
+            }
+          );
+        }
+
+        DirSelect.numItems=DirSelectItems.size();
+      }
+      else{
+        DirSelectItems.clear();
+        DirSelectItems.push_back(
+          {
+            "Error",
+            &pick_a_string,
+            &RadioMenuItems[2].title,
+            NULL,
+            NULL,
+            {0,0}
+          }
+        );
+        DirSelect.numItems=DirSelectItems.size();
+      }
+
+    }
+  }
+
+  
+  enter_submenu(NULL);
+}
+
+void radio_player(void *){
+  if(WiFi.status()!=WL_CONNECTED){
+    error_screen("No WiFi Connection");
+    delay(1000);
+    display_current_menu();
+  }
+  else{
+    String name = RadioMenuItems[2].title;
+    String url = Radio_stations[name];
+    Serial.printf("Current radio station is %s at url %s\n",name.c_str(), url.c_str());
+    const char* c_urls[1] = {url.c_str()};
+    URLStream urlStream("", "");
+    AudioSourceURL source(urlStream, c_urls, "audio/mp3");
+    I2SStream i2s;
+    MP3DecoderHelix decoder;
+    player.setDecoder(decoder);
+    player.setAudioSource(source);
+    auto config = i2s.defaultConfig(TX_MODE);
+    config.pin_ws = DAC_LCK;
+    config.pin_bck = DAC_BCK;
+    config.pin_data = DAC_DIN;
+    i2s.begin(config);
+    player.setOutput(i2s);
+
+
+    CtrlBtn ForwardButton(UP_BTN,50,player_next);
+    CtrlBtn BackButton(DOWN_BTN,50,player_back);
+    //CtrlBtn PlayPauseButton(PAUSE_BUTTON,50,player_play_pause);
+
+    upbutton.setOnPress(increase_vol);
+    downbutton.setOnPress(decrease_vol);
+    button.setOnPress(nullptr);
+    button.setOnRelease(player_play_pause);
+    button.setOnDelayedRelease(long_click);
+    button.setDelayedReleaseDuration(1000);
+
+    is_long_clicked = false;
+    is_short_clicked = false;
+    AudioToolsLogger.begin(Serial, AudioToolsLogLevel::Warning);
+    player.setMetadataCallback(printMetaData);
+    player.begin();
+
+    while(true){
+      player.copy();
+    }
+  }
+}
+//-----------RADIO_END--------------------
+
 //just a wrapper using get_vsys_voltage and draw_value_with_bar
 void display_voltage(void *){
   while(button.isPressed()){
@@ -694,7 +938,7 @@ void setup(void) {
 
   pinMode(POWER_PIN, OUTPUT);
 
-  Serial.begin(15200);
+  Serial.begin(115200);
   delay(200);
   Serial.println("STARTING");
   print_wakeup_reason();
@@ -703,11 +947,22 @@ void setup(void) {
   delay(500);//wait to be sure that there's power
 
   WiFi.mode(WIFI_OFF);
-  esp_bt_controller_disable();
+  //esp_bt_controller_disable();
    
 
-  Wire.begin(DISPLAY_SDA,DISPLAY_SCL);
-  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS_PIN);
+  Wire.setSDA(DISPLAY_SDA);
+  Wire.setSCL(DISPLAY_SCL);
+  Wire.begin();
+  //Wire.begin(DISPLAY_SDA,DISPLAY_SCL);
+
+  SPI.setRX(SD_MISO);
+  SPI.setCS(SD_CS_PIN);
+  SPI.setSCK(SD_SCK);
+  SPI.setTX(SD_MOSI);
+  SPI.begin(true);
+  //SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS_PIN);
+
+  
   if(!u8g2.begin())
     Serial.println("Couldnt start the display");
   

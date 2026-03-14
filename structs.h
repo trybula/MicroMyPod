@@ -1,10 +1,14 @@
+#include <utility>
+#include "AudioTools/CoreAudio/AudioBasic/Str.h"
 #include <sys/_stdint.h>
 #ifndef STRUCTS_H
 #define STRUCTS_H
 #include <vector>
+#include <map>
 #include "config.h"
 #include <Arduino.h>
 #include <U8g2lib.h>
+
 
 //very important structure. Basically, together with MENU, it handles all menu navigation.
 struct MENUITEM 
@@ -112,5 +116,9 @@ struct {
   String Artist;
   bool changed;
 }Meta;
+
+std::map<String,String>Radio_stations;
+//std::vector<String[2]>Radio_stations;
+
 
 #endif
