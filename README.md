@@ -21,5 +21,6 @@
 
 ## 🛠️ Hardware 
 Currently this project is still WIP, and because of some issues connected to certain boards, and how much different crucial libraries  support them, I switch between ESP32S3 pico and Rpi Pico 2W boards. Because of that recreating this project is not the easiest task at this point, and next update may bring breaking changes to one of those platforms. 
+In order for this code to work you need to copy `radio.csv` and `wifi-conf.csv` to the root directory of your sd card.
 
 ![schematic](schematics/Schematic.png "Schematic")
